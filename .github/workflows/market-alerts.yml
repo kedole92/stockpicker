@@ -1,0 +1,106 @@
+name: Market Alerts (IST 9:00 & 13:00)
+
+on:
+  schedule:
+    # 03:30 UTC == 09:00 IST
+    - cron: "30 3 * * 1-5"
+    # 07:30 UTC == 13:00 IST
+    - cron: "30 7 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check trading day (IST)
+        id: daycheck
+        run: |
+          python is_trading_day.py > day.txt
+          val=$(cat day.txt)
+          echo "status=$val" >> $GITHUB_OUTPUT
+          echo "Today status: $val"
+
+      - name: Stop if not trading day
+        if: steps.daycheck.outputs.status != 'TRADING_DAY'
+        run: echo "Market closed. Skipping run."
+
+      - name: Fetch 60m data (yfinance)
+        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+        run: python intraday_fetch_60m.py
+
+      - name: Discover Top-3 (STRICT) and build message
+        id: discover
+        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+        run: |
+          python - << 'PY'
+          import discover_top3 as d
+          df, out_csv, msg = d.run_discovery_and_format()
+          if not hasattr(df, 'empty') or df.empty:
+              print("NO_CANDIDATES")
+          else:
+              print(f"OUT_CSV={out_csv}")
+              with open("wa_message.txt","w", encoding="utf-8") as f:
+                  f.write(msg)
+          PY
+
+      - name: Read WA message
+        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+        id: wamessage
+        run: |
+          if [ -f wa_message.txt ]; then
+            echo "has_msg=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_msg=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send WhatsApp via Twilio
+        if: steps.daycheck.outputs.status == 'TRADING_DAY' && steps.wamessage.outputs.has_msg == 'true'
+        env:
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+          TWILIO_WHATSAPP_TO:   ${{ secrets.TWILIO_WHATSAPP_TO }}
+          WHATSAPP_MESSAGE: ${{ steps.discover.outcome }} # not used; we read file
+        run: |
+          export WHATSAPP_MESSAGE="$(cat wa_message.txt)"
+          python send_whatsapp.py
+
+      - name: Pick latest Top-3 CSV (if any)
+        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+        run: |
+          latest=$(ls -t out_alerts/top3_4h_strict_*.csv | head -n 1 || true)
+          if [ -z "$latest" ]; then
+            echo "LATEST_CSV=" >> $GITHUB_OUTPUT
+          else
+            echo "LATEST_CSV=$latest" >> $GITHUB_OUTPUT
+          fi
+        id: pickcsv
+
+      - name: Email Top-3 CSV
+        if: steps.daycheck.outputs.status == 'TRADING_DAY' && steps.pickcsv.outputs.LATEST_CSV != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "Top-3 (4H STRICT)"
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          body: "Top-3 high probability stocks attached."
+          attachments: ${{ steps.pickcsv.outputs.LATEST_CSV }}
