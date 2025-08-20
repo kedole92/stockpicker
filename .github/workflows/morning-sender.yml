@@ -1,0 +1,111 @@
+name: Morning Sender (09:00 IST)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 09:00 IST = 03:30 UTC
+    - cron: '30 3 * * 1-5'
+
+jobs:
+  morning:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+      TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
+      TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+      TWILIO_WHATSAPP_TO:   ${{ secrets.TWILIO_WHATSAPP_TO }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install twilio
+
+      - name: Skip if weekend/holiday (IST)
+        run: python is_trading_day.py || exit 0
+
+      - name: Ensure file exists
+        id: ensure
+        shell: bash
+        run: |
+          if [ -f out_alerts/top3_nextday_latest.csv ]; then
+            echo "csv_path=out_alerts/top3_nextday_latest.csv" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::No nextday CSV found from last EOD."
+            echo "csv_path=" >> $GITHUB_OUTPUT
+
+      - name: Compose WhatsApp text (NextDay)
+        if: steps.ensure.outputs.csv_path != ''
+        run: |
+          python - <<'PY'
+          import pandas as pd, datetime as dt
+          from pathlib import Path
+          csv = "out_alerts/top3_nextday_latest.csv"
+          df = pd.read_csv(csv)
+          now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+          greet = "Good Morning!"
+          dateline = now.strftime("(%d-%b-%Y)")
+          if df.empty:
+              body = f"{greet}\nNo NextDay setups for today. {dateline}"
+          else:
+              lines = [greet, f"Below are top 3 high probability stocks for today. {dateline}"]
+              for i, r in df.head(3).iterrows():
+                  sym = str(r.get("Symbol","")).replace(".NS","")
+                  bias = r.get("Bias","")
+                  entry = r.get("Entry","")
+                  target = r.get("Target","")
+                  stop = r.get("Stop","")
+                  lines.append(f"{i+1}) {bias} {sym} {entry} {target} {stop} (NextDay)")
+              body = "\n".join(lines)
+          Path("whatsapp_message.txt").write_text(body, encoding="utf-8")
+          print(body)
+          PY
+
+      # Email allowed to fail; WhatsApp must still go
+      - name: Email CSV (optional)
+        if: steps.ensure.outputs.csv_path != ''
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os, smtplib, ssl, mimetypes
+          from email.message import EmailMessage
+          csv = "out_alerts/top3_nextday_latest.csv"
+          host = os.getenv("SMTP_HOST"); port = os.getenv("SMTP_PORT")
+          user = os.getenv("SMTP_USER"); pwd = os.getenv("SMTP_PASS")
+          if not all([host,port,user,pwd]):
+              raise SystemExit("SMTP env not set; skipping email.")
+          msg = EmailMessage()
+          msg["Subject"] = "Top-3 NextDay Picks (4H) – 9AM"
+          msg["From"] = os.environ.get("EMAIL_FROM","alerts@example.com")
+          msg["To"] = os.environ.get("EMAIL_TO","you@example.com")
+          msg.set_content(open("whatsapp_message.txt","r",encoding="utf-8").read())
+          ctype = mimetypes.guess_type(csv)[0] or "text/csv"
+          maintype, subtype = ctype.split("/",1)
+          with open(csv,"rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype,
+                                 filename=os.path.basename(csv))
+          ctx = ssl.create_default_context()
+          with smtplib.SMTP(host, int(port)) as s:
+              s.starttls(context=ctx)
+              s.login(user, pwd)
+              s.send_message(msg)
+          print("Email sent:", csv)
+          PY
+
+      - name: Send WhatsApp via Twilio
+        if: steps.ensure.outputs.csv_path != ''
+        run: |
+          python send_whatsapp.py whatsapp_message.txt
