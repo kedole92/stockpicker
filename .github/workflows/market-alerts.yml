@@ -1,18 +1,29 @@
-name: Market Alerts (IST 9:00 & 13:00)
+name: Market Alerts (IST 12:16 & 15:31)
 
 on:
+  workflow_dispatch:
   schedule:
-    # 03:30 UTC == 09:00 IST
-    - cron: "30 3 * * 1-5"
-    # 07:30 UTC == 13:00 IST
-    - cron: "30 7 * * 1-5"
-  workflow_dispatch: {}
+    # GitHub Actions cron is UTC. IST = UTC+05:30
+    # 12:16 IST -> 06:46 UTC; 15:31 IST -> 10:01 UTC
+    - cron: '46 6 * * 1-5'
+    - cron: '1 10 * * 1-5'
 
 jobs:
-  run:
+  run-alerts:
     runs-on: ubuntu-latest
     env:
-      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Kolkata
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+      TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
+      TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+      TWILIO_WHATSAPP_TO:   ${{ secrets.TWILIO_WHATSAPP_TO }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,87 +31,166 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # fallback if Twilio not in requirements
+          pip install twilio
 
-      - name: Check trading day (IST)
-        id: daycheck
+      - name: Ensure folders
         run: |
-          python is_trading_day.py > day.txt
-          val=$(cat day.txt)
-          echo "status=$val" >> $GITHUB_OUTPUT
-          echo "Today status: $val"
+          mkdir -p data/intraday_60m
+          mkdir -p out_alerts
 
-      - name: Stop if not trading day
-        if: steps.daycheck.outputs.status != 'TRADING_DAY'
-        run: echo "Market closed. Skipping run."
-
-      - name: Fetch 60m data (yfinance)
-        if: steps.daycheck.outputs.status == 'TRADING_DAY'
-        run: python intraday_fetch_60m.py
-
-      - name: Discover Top-3 (STRICT) and build message
-        id: discover
-        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+      - name: Skip if weekend/holiday (IST)
+        id: tradingday
         run: |
-          python - << 'PY'
-          import discover_top3 as d
-          df, out_csv, msg = d.run_discovery_and_format()
-          if not hasattr(df, 'empty') or df.empty:
-              print("NO_CANDIDATES")
-          else:
-              print(f"OUT_CSV={out_csv}")
-              with open("wa_message.txt","w", encoding="utf-8") as f:
-                  f.write(msg)
+          python - <<'PY'
+          import sys, os, pandas as pd, datetime as dt
+          tz = dt.timezone(dt.timedelta(hours=5, minutes=30))
+          today = dt.datetime.now(tz).date()
+          # weekend?
+          if today.weekday() >= 5:
+              print("::notice::Weekend (IST). Skipping.")
+              sys.exit(0)
+          # holidays?
+          path = "market_holidays.txt"
+          if os.path.exists(path):
+              holidays = set()
+              with open(path) as f:
+                  for line in f:
+                      s=line.strip()
+                      if not s: continue
+                      try:
+                          holidays.add(pd.to_datetime(s).date())
+                      except: pass
+              if today in holidays:
+                  print(f"::notice::Holiday {today}. Skipping.")
+                  sys.exit(0)
+          print("Trading day.")
           PY
 
-      - name: Read WA message
-        if: steps.daycheck.outputs.status == 'TRADING_DAY'
-        id: wamessage
+      - name: Fetch 60m data
+        run: python intraday_fetch_60m.py
+
+      - name: Discover Top-3 (strict)
+        run: python discover_top3.py
+
+      - name: Find latest CSV in out_alerts
+        id: findcsv
+        shell: bash
         run: |
-          if [ -f wa_message.txt ]; then
-            echo "has_msg=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_msg=false" >> $GITHUB_OUTPUT
+          LATEST=$(ls -1t out_alerts/*.csv | head -n 1 || true)
+          if [ -z "$LATEST" ]; then
+            echo "::warning::No CSV produced."
+            echo "csv_path=" >> $GITHUB_OUTPUT
+            exit 0
           fi
+          echo "Latest CSV: $LATEST"
+          echo "csv_path=$LATEST" >> $GITHUB_OUTPUT
+
+      - name: Compose WhatsApp message
+        id: compose
+        if: steps.findcsv.outputs.csv_path != ''
+        run: |
+          python - <<'PY'
+          import os, pandas as pd, datetime as dt
+          from pathlib import Path
+          csv_path = "${{ steps.findcsv.outputs.csv_path }}"
+          df = pd.read_csv(csv_path)
+          now = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+          greet = "Good Morning!" if now.hour < 12 else "Good Afternoon!"
+          dateline = now.strftime("(%d-%b-%Y)")
+          if df.empty:
+              body = f"{greet}\nNo near-zone setups today. {dateline}"
+          else:
+              lines = [greet, f"Below are top 3 high probability stocks for today. {dateline}"]
+              # Expect columns: Symbol,Bias,Entry,Target,Stop,(optional ActionDay)
+              # limit to 3
+              for i, r in df.head(3).iterrows():
+                  sym = str(r.get("Symbol","")).replace(".NS","")
+                  bias = r.get("Bias","")
+                  entry = r.get("Entry","")
+                  target = r.get("Target","")
+                  stop = r.get("Stop","")
+                  action = r.get("ActionDay","")
+                  suffix = f" ({action})" if isinstance(action,str) and action else ""
+                  lines.append(f"{i+1}) {bias} {sym} {entry} {target} {stop}{suffix}")
+              body = "\n".join(lines)
+          Path("whatsapp_message.txt").write_text(body, encoding="utf-8")
+          print(body)
+          PY
 
       - name: Send WhatsApp via Twilio
-        if: steps.daycheck.outputs.status == 'TRADING_DAY' && steps.wamessage.outputs.has_msg == 'true'
-        env:
-          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
-          TWILIO_AUTH_TOKEN:  ${{ secrets.TWILIO_AUTH_TOKEN }}
-          TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
-          TWILIO_WHATSAPP_TO:   ${{ secrets.TWILIO_WHATSAPP_TO }}
-          WHATSAPP_MESSAGE: ${{ steps.discover.outcome }} # not used; we read file
+        if: steps.findcsv.outputs.csv_path != ''
         run: |
-          export WHATSAPP_MESSAGE="$(cat wa_message.txt)"
-          python send_whatsapp.py
+          python - <<'PY'
+          import os
+          from twilio.rest import Client
+          sid = os.environ["TWILIO_ACCOUNT_SID"]
+          tok = os.environ["TWILIO_AUTH_TOKEN"]
+          from_num = os.environ["TWILIO_WHATSAPP_FROM"]
+          to_num = os.environ["TWILIO_WHATSAPP_TO"]
+          body = open("whatsapp_message.txt","r",encoding="utf-8").read()
+          client = Client(sid, tok)
+          msg = client.messages.create(
+              body=body,
+              from_=f"whatsapp:{from_num}",
+              to=f"whatsapp:{to_num}"
+          )
+          print("Sent WhatsApp SID:", msg.sid)
+          PY
 
-      - name: Pick latest Top-3 CSV (if any)
-        if: steps.daycheck.outputs.status == 'TRADING_DAY'
+      - name: Email CSV
+        if: steps.findcsv.outputs.csv_path != ''
         run: |
-          latest=$(ls -t out_alerts/top3_4h_strict_*.csv | head -n 1 || true)
-          if [ -z "$latest" ]; then
-            echo "LATEST_CSV=" >> $GITHUB_OUTPUT
-          else
-            echo "LATEST_CSV=$latest" >> $GITHUB_OUTPUT
-          fi
-        id: pickcsv
+          python - <<'PY'
+          import os, smtplib, ssl, mimetypes
+          from email.message import EmailMessage
+          csv_path = "${{ steps.findcsv.outputs.csv_path }}"
+          EMAIL_FROM = os.environ["EMAIL_FROM"]
+          EMAIL_TO   = os.environ["EMAIL_TO"]
+          host = os.environ["SMTP_HOST"]
+          port = int(os.environ["SMTP_PORT"])
+          user = os.environ["SMTP_USER"]
+          pwd  = os.environ["SMTP_PASS"]
 
-      - name: Email Top-3 CSV
-        if: steps.daycheck.outputs.status == 'TRADING_DAY' && steps.pickcsv.outputs.LATEST_CSV != ''
-        uses: dawidd6/action-send-mail@v3
+          msg = EmailMessage()
+          msg["Subject"] = "Top-3 Zone Picks (4H) – Auto"
+          msg["From"] = EMAIL_FROM
+          msg["To"] = EMAIL_TO
+
+          body = open("whatsapp_message.txt","r",encoding="utf-8").read()
+          msg.set_content(body)
+
+          ctype, encoding = mimetypes.guess_type(csv_path)
+          maintype, subtype = (ctype or "text/csv").split("/", 1)
+          with open(csv_path, "rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype,
+                                 filename=os.path.basename(csv_path))
+
+          ctx = ssl.create_default_context()
+          with smtplib.SMTP(host, port) as s:
+              s.starttls(context=ctx)
+              s.login(user, pwd)
+              s.send_message(msg)
+          print("Email sent with attachment:", csv_path)
+          PY
+
+      - name: Upload CSV artifact
+        if: steps.findcsv.outputs.csv_path != ''
+        uses: actions/upload-artifact@v4
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USER }}
-          password: ${{ secrets.SMTP_PASS }}
-          subject: "Top-3 (4H STRICT)"
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_FROM }}
-          body: "Top-3 high probability stocks attached."
-          attachments: ${{ steps.pickcsv.outputs.LATEST_CSV }}
+          name: top3-alert-csv
+          path: ${{ steps.findcsv.outputs.csv_path }}
