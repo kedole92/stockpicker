@@ -6,8 +6,32 @@ import pytz
 
 # --- CONFIG ---
 # Load symbols from file
-with open(r"D:\\AI\\TIZ\\data\\nifty100.txt") as f:
-    SYMBOLS = [line.strip() for line in f if line.strip()]
+import os
+
+# Symbols file: allow override via env, else default to repo path
+SYMBOLS_FILE = os.getenv("SYMBOLS_FILE", os.path.join("data", "nifty100.txt"))
+
+def load_symbols(path: str):
+    syms = []
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Symbols file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            syms.append(s)
+    # de-dup, preserve order
+    seen = set()
+    uniq = []
+    for s in syms:
+        if s not in seen:
+            uniq.append(s); seen.add(s)
+    print(f"[info] Loaded {len(uniq)} symbols from {path}")
+    return uniq
+
+SYMBOLS = load_symbols(SYMBOLS_FILE)
+
 
 print(f"[info] Loaded {len(SYMBOLS)} symbols from nifty100.txt")
 
