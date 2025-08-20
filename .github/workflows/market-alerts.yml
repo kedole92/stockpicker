@@ -87,6 +87,25 @@ jobs:
       - name: Discover Top-3 (strict)
         run: python discover_top3.py
 
+      - name: Make NextDay-only CSV
+        if: steps.findcsv.outputs.csv_path != ''
+        run: |
+          python - <<'PY'
+          import pandas as pd, shutil
+          src = "${{ steps.findcsv.outputs.csv_path }}"
+          df = pd.read_csv(src)
+          nd = df[df.get("ActionDay","")=="NextDay"].copy()
+          out = "out_alerts/top3_nextday_latest.csv"
+          if not nd.empty:
+              nd.to_csv(out, index=False)
+              print("Wrote:", out)
+          else:
+              # keep empty file (so morning workflow still runs gracefully)
+              nd.to_csv(out, index=False)
+              print("No NextDay rows; wrote empty:", out)
+          PY
+
+
       - name: Find latest CSV in out_alerts
         id: findcsv
         shell: bash
